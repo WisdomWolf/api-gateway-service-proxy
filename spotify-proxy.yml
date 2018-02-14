@@ -1,0 +1,100 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Provisions an API Gateway resource that proxies requests to Spotify authorization gateway
+  "Credentials-less service access using an IAM authenticated API Gateway as a proxy™"
+
+Parameters:
+  Environment:
+    Type: String
+    Description: "Use this to differentiate your dev, staging and production environments."
+    AllowedValues:
+    - prod
+    - stage
+    - dev
+
+  SpotifyAuthorizationCredentials:
+    Type: String
+    Description: "Base 64 encoded string that contains the client ID and client secret key.  https://developer.spotify.com/web-api/authorization-guide/"
+    NoEcho: false
+
+
+Resources:
+  # The top level resource that contains the API Gateway resources
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${Environment}-spotify-api-token-proxy
+
+  # Tells API Gateway to catch any path (first step to define a proxy)
+  ProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: '{proxy+}'
+      RestApiId: !Ref RestApi
+
+  # Tells API Gateway to catch any method (now we have a passthrough proxy)
+  # Special note: After the method creation, changes made here are not automatically deployed and this needs to be done
+  # using the "Deploy API" button in the API Gateway console afterward.
+  ProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ResourceId: !Ref ProxyResource
+      RestApiId: !Ref RestApi
+      # The secret weapon: enforce that requests made to this endpoint need to be signed
+      AuthorizationType: AWS_IAM
+      HttpMethod: ANY
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        IntegrationHttpMethod: ANY
+        Type: HTTP_PROXY
+        Uri: !Sub https://accounts.spotify.com/api/token{proxy}
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+          # This is were the credentials injection happens
+          # Note: you may want to adapt this if you plan on using this on another service
+          integration.request.header.Authorization: !Sub "'Basic ${SpotifyAuthorizationCredentials}'"
+          # By default CloudFront (fronting API Gateway) use the Accept-Encoding: gzip
+          # Let's change this to something more human-readable
+          integration.request.header.Accept-Encoding: "'application/json'"
+
+  # Required so our API can go live
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ProxyMethod
+    Properties:
+      RestApiId: !Ref RestApi
+
+  # This glues everything together
+  Stage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: !Ref Environment
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref Deployment
+
+  # This policy will only allow listing issues in the specified repository. Attach this to an IAM role (or user)
+  Policy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: "Only allows listing issues in the specified repository"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - execute-api:Invoke
+          Resource:
+          - !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/${Environment}/GET/
+
+
+Outputs:
+  # Use this endpoint when issuing call to Spotify
+  GetSpotifyProxyEndpointURL:
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/
+
+  # Attach this policy to the role on an EC2 instance, ECS container or Lambda
+  GetSpotifyProxyPolicyArn:
+    Value: !Ref Policy
+
